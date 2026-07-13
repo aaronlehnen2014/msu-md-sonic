@@ -31,8 +31,9 @@ EEgg_Main:	; Routine 0
 
 		move.b	#id_CreditsText,(v_objspace+$C0).w ; load credits object
 		move.w	#9,(v_creditsnum).w ; use "TRY AGAIN" text
+		jsr	msuPlayTrack_17            ; explicitly start MSU credits track
 		move.b	#id_TryChaos,(v_objspace+$800).w ; load emeralds object on "TRY AGAIN" screen
-		move.b	#0,obAnim(a0)	; use "TRY AGAIN" animation
+		move.b	#0,obAnim(a0) 	; use "TRY AGAIN" animation
 
 EEgg_Animate:	; Routine 2
 		lea	(Ani_EEgg).l,a1
