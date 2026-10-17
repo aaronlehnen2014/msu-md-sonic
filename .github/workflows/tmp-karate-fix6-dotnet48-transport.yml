@@ -1,0 +1,31 @@
+name: Temporary Karate Fix6 .NET 4.8 Transport
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-karate-fix6-dotnet48-transport.yml'
+  workflow_dispatch:
+
+jobs:
+  fetch-dotnet48:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download official .NET Framework 4.8 offline installer
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 3 \
+            'https://download.visualstudio.microsoft.com/download/pr/2d6bb6b2-226a-4baa-bdec-798822606ff1/8494001c276a4b96804cde7829c04d7f/ndp48-x86-x64-allos-enu.exe' \
+            -o NDP48-x86-x64-AllOS-ENU.exe
+          echo '0a3a390c47e639d0f7fc65b21195fee6b7f65b066f80f70c60fab191d14b7e40  NDP48-x86-x64-AllOS-ENU.exe' | sha256sum -c -
+          stat -c '%n %s bytes' NDP48-x86-x64-AllOS-ENU.exe
+
+      - name: Upload verified installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: karate-fix6-dotnet48-offline
+          path: NDP48-x86-x64-AllOS-ENU.exe
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
