@@ -1,0 +1,174 @@
+name: Temporary Karate Fix6 Secure Windows Convert
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-karate-fix6-secure-windows-convert.yml'
+  workflow_dispatch:
+
+jobs:
+  secure-convert:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Generate ephemeral runner RSA key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rsa = [System.Security.Cryptography.RSA]::Create(4096)
+          $private = $rsa.ExportPkcs8PrivateKey()
+          $public = $rsa.ExportSubjectPublicKeyInfo()
+          [System.IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'fix6-runner-private.der'), $private)
+          Write-Host "FIX6_RUNNER_PUBLIC_KEY_DER_B64=$([Convert]::ToBase64String($public))"
+          Write-Host 'FIX6_RUNNER_KEY_READY'
+
+      - name: Wait for encrypted payload and decrypt
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          function Get-RepoBinary([string]$path) {
+            $escaped = ($path -split '/') | ForEach-Object { [uri]::EscapeDataString($_) }
+            $url = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/$($escaped -join '/')?ref=master"
+            $obj = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+            if (-not $obj.content) { throw "No inline content returned for $path" }
+            return [Convert]::FromBase64String(($obj.content -replace '\s',''))
+          }
+          $payloadPath = '.github/tmp-karate-fix6/payload.enc'
+          $keyPath = '.github/tmp-karate-fix6/payload-key.enc'
+          $payload = $null
+          $wrappedKey = $null
+          for ($i=0; $i -lt 120; $i++) {
+            try {
+              $payload = Get-RepoBinary $payloadPath
+              $wrappedKey = Get-RepoBinary $keyPath
+              break
+            } catch {
+              Start-Sleep -Seconds 2
+            }
+          }
+          if ($null -eq $payload -or $null -eq $wrappedKey) { throw 'Encrypted payload did not arrive before timeout.' }
+
+          $rsa = [System.Security.Cryptography.RSA]::Create()
+          $priv = [System.IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'fix6-runner-private.der'))
+          $read = 0
+          $rsa.ImportPkcs8PrivateKey($priv, [ref]$read)
+          $aesKey = $rsa.Decrypt($wrappedKey, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          if ($aesKey.Length -ne 32) { throw 'Decrypted AES key length is not 32 bytes.' }
+          if ($payload.Length -lt 29) { throw 'Encrypted payload is too short.' }
+          [byte[]]$nonce = $payload[0..11]
+          [byte[]]$tag = $payload[12..27]
+          [byte[]]$cipher = $payload[28..($payload.Length-1)]
+          [byte[]]$plain = New-Object byte[] $cipher.Length
+          $aes = [System.Security.Cryptography.AesGcm]::new($aesKey, 16)
+          $aes.Decrypt($nonce, $cipher, $tag, $plain)
+          $zip = Join-Path $env:RUNNER_TEMP 'fix6-payload.zip'
+          [System.IO.File]::WriteAllBytes($zip, $plain)
+          $work = Join-Path $env:RUNNER_TEMP 'fix6-work'
+          Expand-Archive -Path $zip -DestinationPath $work -Force
+          "FIX6_WORK=$work" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host 'FIX6_PAYLOAD_DECRYPTED'
+
+      - name: Verify private payload hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function NeedHash([string]$file,[string]$want) {
+            $got=(Get-FileHash (Join-Path $env:FIX6_WORK $file) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($got -ne $want) { throw "$file hash mismatch: $got" }
+            Write-Host "$file SHA256=$got"
+          }
+          NeedHash 'Project_Nested.exe' '33a256a3a80b35ef41d1151b89e68b79ae7ed436762cf61b7f9a6c1c22204eb1'
+          NeedHash 'Project_Nested.smc' '58de4d61a524e4f718c660f7210668c3a83172e868ee966ae0f786870a448f5f'
+          NeedHash 'item8-source-fixed.nes' '532e7d2216061df9cc63f6e7bafa9059cd7469bbec6807934b7098f17a6bf3c2'
+          NeedHash 'item8-source-collision.nes' 'e3c62dd03ce325f25d3f1bf134603a812c5c4385047abcd3d68e5de7d62c985d'
+          NeedHash 'item8-call-seed.txt' '48a43c8a4c831f422307c6787af25077b882bd9a9d911bbcc551860d54bd76d3'
+          NeedHash 'item8-call-seed-collision.txt' '7470767ca2a78ce4ce61039de64f3202b926edc517c2b8aa796591cd1d345d4a'
+
+      - name: Reproduce authoritative pre-collision control
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:FIX6_WORK
+          try {
+            & .\Project_Nested.exe '.\item8-source-fixed.nes' '.\control-repro.sfc' 'Karate Champ Rev A' 'Karate Champ MSU' 'twin' 'true' 'default' '.\item8-call-seed.txt' 2>&1 | Tee-Object -FilePath '.\control.log'
+            if ($LASTEXITCODE -ne 0) { throw "Control converter exit code $LASTEXITCODE" }
+            $hash=(Get-FileHash '.\control-repro.sfc' -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "FIX6_CONTROL_SHA256=$hash"
+            if ($hash -ne 'b6cc13859a769fb6d9d8e90977561d9760481d25a20ed7fe8f2260b81a7be917') { throw 'Authoritative b6cc control reproduction failed.' }
+            $text=Get-Content '.\control.log' -Raw
+            if ($text -notmatch 'Known calls:\s*230') { throw 'Control known-call count is not 230.' }
+            Write-Host 'FIX6_WINDOWS_CONTROL_REPRO_PASS'
+          } finally { Pop-Location }
+
+      - name: Convert canonical Fix6 collision source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:FIX6_WORK
+          try {
+            & .\Project_Nested.exe '.\item8-source-collision.nes' '.\KC_ITEM8_FIX6_COLLISION_WINDOWS.sfc' 'Karate Champ Rev A' 'Karate Champ MSU' 'twin' 'true' 'default' '.\item8-call-seed-collision.txt' 2>&1 | Tee-Object -FilePath '.\collision.log'
+            if ($LASTEXITCODE -ne 0) { throw "Collision converter exit code $LASTEXITCODE" }
+            $hash=(Get-FileHash '.\KC_ITEM8_FIX6_COLLISION_WINDOWS.sfc' -Algorithm SHA256).Hash.ToLowerInvariant()
+            $size=(Get-Item '.\KC_ITEM8_FIX6_COLLISION_WINDOWS.sfc').Length
+            if ($size -ne 2097152) { throw "Collision SFC size is $size, expected 2097152." }
+            if ($hash -eq 'b6cc13859a769fb6d9d8e90977561d9760481d25a20ed7fe8f2260b81a7be917') { throw 'Collision output unexpectedly equals unchanged b6cc.' }
+            if ($hash -eq 'c6d2df12a035589cccd5549d10553c8945574c164e79422dfcdfc8089717ad17') { throw 'Collision output unexpectedly equals temporary native proof.' }
+            Write-Host "FIX6_COLLISION_WINDOWS_SHA256=$hash"
+            Write-Host 'FIX6_COLLISION_WINDOWS_BUILD_PASS'
+          } finally { Pop-Location }
+
+      - name: Encrypt result for return
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work=$env:FIX6_WORK
+          $resultDir=Join-Path $env:RUNNER_TEMP 'fix6-result'
+          New-Item -ItemType Directory -Force -Path $resultDir | Out-Null
+          Copy-Item (Join-Path $work 'KC_ITEM8_FIX6_COLLISION_WINDOWS.sfc') $resultDir
+          Copy-Item (Join-Path $work 'control.log') $resultDir
+          Copy-Item (Join-Path $work 'collision.log') $resultDir
+          $controlHash=(Get-FileHash (Join-Path $work 'control-repro.sfc') -Algorithm SHA256).Hash.ToLowerInvariant()
+          $collisionHash=(Get-FileHash (Join-Path $work 'KC_ITEM8_FIX6_COLLISION_WINDOWS.sfc') -Algorithm SHA256).Hash.ToLowerInvariant()
+          @("control_sha256=$controlHash","collision_sha256=$collisionHash") | Set-Content (Join-Path $resultDir 'HASHES.txt') -Encoding ascii
+          $resultZip=Join-Path $env:RUNNER_TEMP 'fix6-result.zip'
+          Compress-Archive -Path (Join-Path $resultDir '*') -DestinationPath $resultZip -Force
+
+          $pubDer=[System.IO.File]::ReadAllBytes((Join-Path $work 'return-public.der'))
+          $rsa=[System.Security.Cryptography.RSA]::Create()
+          $read=0
+          $rsa.ImportSubjectPublicKeyInfo($pubDer,[ref]$read)
+          [byte[]]$aesKey=[System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+          [byte[]]$nonce=[System.Security.Cryptography.RandomNumberGenerator]::GetBytes(12)
+          [byte[]]$plain=[System.IO.File]::ReadAllBytes($resultZip)
+          [byte[]]$cipher=New-Object byte[] $plain.Length
+          [byte[]]$tag=New-Object byte[] 16
+          $aes=[System.Security.Cryptography.AesGcm]::new($aesKey,16)
+          $aes.Encrypt($nonce,$plain,$cipher,$tag)
+          [byte[]]$blob=New-Object byte[] (28+$cipher.Length)
+          [Array]::Copy($nonce,0,$blob,0,12)
+          [Array]::Copy($tag,0,$blob,12,16)
+          [Array]::Copy($cipher,0,$blob,28,$cipher.Length)
+          [System.IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'fix6-result.enc'),$blob)
+          $wrapped=$rsa.Encrypt($aesKey,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          [System.IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'fix6-result-key.enc'),$wrapped)
+          Write-Host 'FIX6_RESULT_ENCRYPTED'
+
+      - name: Upload encrypted result only
+        uses: actions/upload-artifact@v4
+        with:
+          name: karate-fix6-encrypted-result
+          path: |
+            ${{ runner.temp }}/fix6-result.enc
+            ${{ runner.temp }}/fix6-result-key.enc
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
