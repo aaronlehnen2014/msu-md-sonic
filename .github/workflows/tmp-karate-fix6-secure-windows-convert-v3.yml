@@ -1,0 +1,139 @@
+name: Temporary Karate Fix6 Secure Windows Convert v3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-karate-fix6-secure-windows-convert-v3.yml'
+  workflow_dispatch:
+
+jobs:
+  secure-convert:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate ephemeral runner RSA key
+        shell: pwsh
+        run: |
+          $rsa=[Security.Cryptography.RSA]::Create(4096)
+          [IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'runner-private.der'),$rsa.ExportPkcs8PrivateKey())
+          [IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'runner-public.der'),$rsa.ExportSubjectPublicKeyInfo())
+
+      - name: Upload public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: karate-fix6-runner-public-key-v3
+          path: ${{ runner.temp }}/runner-public.der
+          compression-level: 0
+          retention-days: 1
+
+      - name: Build exact Project NeSTed CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          git clone https://github.com/Myself086/Project-Nested.git upstream
+          Push-Location upstream
+          git checkout cc2c892be2e4f105a4780879022777b57f62052f
+          if((git rev-parse HEAD).Trim()-ne'cc2c892be2e4f105a4780879022777b57f62052f'){throw 'Project NeSTed commit mismatch'}
+          Pop-Location
+          Copy-Item -Force '.github/tmp-karate-fix6-v3/ProjectNestedCliProgram.cs' 'upstream/Project Nested/Program.cs'
+          $proj='upstream/Project Nested/Project Nested.csproj'
+          $t=Get-Content -Raw $proj
+          $t=$t.Replace('<OutputType>WinExe</OutputType>','<OutputType>Exe</OutputType>')
+          $t=$t.Replace('<TargetFrameworkVersion>v4.6.1</TargetFrameworkVersion>','<TargetFrameworkVersion>v4.8</TargetFrameworkVersion>')
+          Set-Content -NoNewline -Encoding UTF8 $proj $t
+          $msbuild=vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe|Select-Object -First 1
+          if(-not $msbuild){throw 'MSBuild missing'}
+          & $msbuild $proj /m /p:Configuration=Release /p:Platform=AnyCPU
+          if($LASTEXITCODE-ne0){throw "MSBuild exit $LASTEXITCODE"}
+          $exe='upstream/Project Nested/bin/Release/Project_Nested.exe'
+          $smc='upstream/Project Nested/bin/Release/Project_Nested.smc'
+          $eh=(Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant();$sh=(Get-FileHash $smc -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "FIX6_BUILT_EXE_SHA256=$eh";Write-Host "FIX6_BUILT_SMC_SHA256=$sh"
+          if($eh-ne'33a256a3a80b35ef41d1151b89e68b79ae7ed436762cf61b7f9a6c1c22204eb1'){throw 'Converter EXE hash differs from recovered authoritative converter'}
+          if($sh-ne'58de4d61a524e4f718c660f7210668c3a83172e868ee966ae0f786870a448f5f'){throw 'Project_Nested.smc hash mismatch'}
+          Write-Host 'FIX6_CONVERTER_REPRO_PASS'
+
+      - name: Wait for encrypted private payload
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          function GetText([string]$p){
+            $ep=(($p-split'/')|%{[uri]::EscapeDataString($_)})-join'/'
+            $o=Invoke-RestMethod -Headers $h -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/$ep`?ref=master"
+            [Text.Encoding]::ASCII.GetString([Convert]::FromBase64String(($o.content-replace'\s',''))).Trim()
+          }
+          $pb=$null;$kb=$null
+          for($i=0;$i-lt180;$i++){try{$pb=GetText '.github/tmp-karate-fix6-v3/payload.b64';$kb=GetText '.github/tmp-karate-fix6-v3/payload-key.b64';break}catch{Start-Sleep 2}}
+          if(-not $pb-or-not $kb){throw 'Encrypted payload timeout'}
+          [byte[]]$blob=[Convert]::FromBase64String($pb);[byte[]]$wrapped=[Convert]::FromBase64String($kb)
+          $rsa=[Security.Cryptography.RSA]::Create();$n=0;$rsa.ImportPkcs8PrivateKey([IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'runner-private.der')),[ref]$n)
+          $k=$rsa.Decrypt($wrapped,[Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          [byte[]]$nonce=$blob[0..11];[byte[]]$tag=$blob[12..27];[byte[]]$ct=$blob[28..($blob.Length-1)];[byte[]]$plain=New-Object byte[] $ct.Length
+          $aes=[Security.Cryptography.AesGcm]::new($k,16);$aes.Decrypt($nonce,$ct,$tag,$plain)
+          $zip=Join-Path $env:RUNNER_TEMP 'payload.zip';[IO.File]::WriteAllBytes($zip,$plain)
+          $work=Join-Path $env:RUNNER_TEMP 'fix6';Expand-Archive $zip $work -Force
+          Copy-Item 'upstream/Project Nested/bin/Release/Project_Nested.exe' $work
+          Copy-Item 'upstream/Project Nested/bin/Release/Project_Nested.smc' $work
+          $cfg='upstream/Project Nested/bin/Release/Project_Nested.exe.config';if(Test-Path $cfg){Copy-Item $cfg $work}
+          "FIX6_WORK=$work"|Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify and regenerate collision NES
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop';$w=$env:FIX6_WORK
+          $fh=(Get-FileHash (Join-Path $w 'item8-source-fixed.nes') -Algorithm SHA256).Hash.ToLowerInvariant();if($fh-ne'532e7d2216061df9cc63f6e7bafa9059cd7469bbec6807934b7098f17a6bf3c2'){throw "fixed NES hash $fh"}
+          $d=[IO.File]::ReadAllBytes((Join-Path $w 'item8-source-fixed.nes'))
+          $patches=@{
+            0x1b01='4c8be7';
+            0x679b='a58c293fc920f004c921d00a20d5';
+            0x67aa='b005a00a4c229ba00aa5874cf59a';
+            0x7fe5='a58738e58eb00549';
+            0x7fee='186901c91960'
+          }
+          foreach($o in $patches.Keys){$hex=$patches[$o];[byte[]]$b=for($i=0;$i-lt$hex.Length;$i+=2){[Convert]::ToByte($hex.Substring($i,2),16)};[Array]::Copy($b,0,$d,[int]$o,$b.Length)}
+          $cp=Join-Path $w 'item8-source-collision.nes';[IO.File]::WriteAllBytes($cp,$d)
+          $ch=(Get-FileHash $cp -Algorithm SHA256).Hash.ToLowerInvariant();if($ch-ne'e3c62dd03ce325f25d3f1bf134603a812c5c4385047abcd3d68e5de7d62c985d'){throw "collision NES hash $ch"}
+          if((Get-FileHash (Join-Path $w 'item8-call-seed.txt') -Algorithm SHA256).Hash.ToLowerInvariant()-ne'48a43c8a4c831f422307c6787af25077b882bd9a9d911bbcc551860d54bd76d3'){throw 'old seed hash mismatch'}
+          if((Get-FileHash (Join-Path $w 'item8-call-seed-collision.txt') -Algorithm SHA256).Hash.ToLowerInvariant()-ne'7470767ca2a78ce4ce61039de64f3202b926edc517c2b8aa796591cd1d345d4a'){throw 'collision seed hash mismatch'}
+          Write-Host 'FIX6_PRIVATE_INPUT_PASS'
+
+      - name: Reproduce b6cc then build Fix6
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop';Push-Location $env:FIX6_WORK
+          & .\Project_Nested.exe '.\item8-source-fixed.nes' '.\control.sfc' 'Karate Champ Rev A' 'Karate Champ MSU' 'twin' 'true' 'default' '.\item8-call-seed.txt' 2>&1|Tee-Object '.\control.log'
+          if($LASTEXITCODE-ne0){throw "control exit $LASTEXITCODE"}
+          $bh=(Get-FileHash '.\control.sfc' -Algorithm SHA256).Hash.ToLowerInvariant();Write-Host "FIX6_CONTROL_SHA256=$bh"
+          if($bh-ne'b6cc13859a769fb6d9d8e90977561d9760481d25a20ed7fe8f2260b81a7be917'){throw 'b6cc control reproduction failed'}
+          if((Get-Content '.\control.log' -Raw)-notmatch'Known calls:\s*230'){throw 'control known calls != 230'}
+          Write-Host 'FIX6_WINDOWS_CONTROL_REPRO_PASS'
+          & .\Project_Nested.exe '.\item8-source-collision.nes' '.\collision.sfc' 'Karate Champ Rev A' 'Karate Champ MSU' 'twin' 'true' 'default' '.\item8-call-seed-collision.txt' 2>&1|Tee-Object '.\collision.log'
+          if($LASTEXITCODE-ne0){throw "collision exit $LASTEXITCODE"}
+          $h=(Get-FileHash '.\collision.sfc' -Algorithm SHA256).Hash.ToLowerInvariant();$s=(Get-Item '.\collision.sfc').Length
+          if($s-ne2097152){throw "collision size $s"};if($h-eq'b6cc13859a769fb6d9d8e90977561d9760481d25a20ed7fe8f2260b81a7be917'){throw 'collision unchanged'}
+          Write-Host "FIX6_COLLISION_WINDOWS_SHA256=$h";Write-Host 'FIX6_COLLISION_WINDOWS_BUILD_PASS';Pop-Location
+
+      - name: Encrypt result to local return key
+        shell: pwsh
+        run: |
+          $w=$env:FIX6_WORK;$d=Join-Path $env:RUNNER_TEMP 'result';New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item (Join-Path $w 'collision.sfc') $d;Copy-Item (Join-Path $w 'control.log') $d;Copy-Item (Join-Path $w 'collision.log') $d
+          $c=(Get-FileHash (Join-Path $w 'control.sfc') -Algorithm SHA256).Hash.ToLowerInvariant();$h=(Get-FileHash (Join-Path $w 'collision.sfc') -Algorithm SHA256).Hash.ToLowerInvariant();@("control_sha256=$c","collision_sha256=$h")|Set-Content (Join-Path $d 'HASHES.txt') -Encoding ascii
+          $z=Join-Path $env:RUNNER_TEMP 'result.zip';Compress-Archive (Join-Path $d '*') $z -Force
+          $rsa=[Security.Cryptography.RSA]::Create();$n=0;$rsa.ImportSubjectPublicKeyInfo([IO.File]::ReadAllBytes((Join-Path $w 'return-public.der')),[ref]$n);[byte[]]$k=[Security.Cryptography.RandomNumberGenerator]::GetBytes(32);[byte[]]$nonce=[Security.Cryptography.RandomNumberGenerator]::GetBytes(12);[byte[]]$p=[IO.File]::ReadAllBytes($z);[byte[]]$ct=New-Object byte[] $p.Length;[byte[]]$tag=New-Object byte[] 16;$aes=[Security.Cryptography.AesGcm]::new($k,16);$aes.Encrypt($nonce,$p,$ct,$tag);[byte[]]$b=New-Object byte[] (28+$ct.Length);[Array]::Copy($nonce,0,$b,0,12);[Array]::Copy($tag,0,$b,12,16);[Array]::Copy($ct,0,$b,28,$ct.Length);[IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'result.enc'),$b);[IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'result-key.enc'),$rsa.Encrypt($k,[Security.Cryptography.RSAEncryptionPadding]::OaepSHA256))
+
+      - name: Upload encrypted result only
+        uses: actions/upload-artifact@v4
+        with:
+          name: karate-fix6-encrypted-result-v3
+          path: |
+            ${{ runner.temp }}/result.enc
+            ${{ runner.temp }}/result-key.enc
+          compression-level: 0
+          retention-days: 1
