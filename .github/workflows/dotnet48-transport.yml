@@ -1,0 +1,45 @@
+name: DotNet48 Transport
+
+on:
+  push:
+    branches:
+      - ci/dotnet48-transport-20261016
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2025
+    steps:
+      - name: Download official .NET Framework 4.8 redistributable
+        shell: pwsh
+        run: |
+          $url = 'https://download.microsoft.com/download/f/3/a/f3a6af84-da23-40a5-8d1c-49cc10c8e76f/NDP48-x86-x64-AllOS-ENU.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'NDP48-x86-x64-AllOS-ENU.exe'
+          Invoke-WebRequest -Uri $url -OutFile $out
+          $expectedHash = '0a3a390c47e639d0f7fc65b21195fee6b7f65b066f80f70c60fab191d14b7e40'
+          $expectedSize = 121346568
+          $actualHash = (Get-FileHash -Algorithm SHA256 $out).Hash.ToLowerInvariant()
+          $actualSize = (Get-Item $out).Length
+          Write-Host "sha256=$actualHash"
+          Write-Host "size=$actualSize"
+          if ($actualHash -ne $expectedHash) { throw "SHA-256 mismatch: $actualHash" }
+          if ($actualSize -ne $expectedSize) { throw "Size mismatch: $actualSize" }
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item $out artifact/NDP48-x86-x64-AllOS-ENU.exe
+          @(
+            "source=$url",
+            "sha256=$actualHash",
+            "size=$actualSize"
+          ) | Set-Content -Encoding ascii artifact/MANIFEST.txt
+
+      - name: Upload verified redistributable
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-dotnet48-offline-installer
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
