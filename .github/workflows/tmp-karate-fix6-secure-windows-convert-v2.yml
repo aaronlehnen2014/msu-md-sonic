@@ -1,0 +1,114 @@
+name: Temporary Karate Fix6 Secure Windows Convert v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-karate-fix6-secure-windows-convert-v2.yml'
+  workflow_dispatch:
+
+jobs:
+  secure-convert:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Generate ephemeral runner RSA key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $rsa=[System.Security.Cryptography.RSA]::Create(4096)
+          [IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'runner-private.der'),$rsa.ExportPkcs8PrivateKey())
+          [IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'runner-public.der'),$rsa.ExportSubjectPublicKeyInfo())
+          Write-Host 'FIX6_RUNNER_KEY_READY'
+
+      - name: Upload public key
+        uses: actions/upload-artifact@v4
+        with:
+          name: karate-fix6-runner-public-key-v2
+          path: ${{ runner.temp }}/runner-public.der
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Wait for encrypted payload and decrypt
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          function GetBin([string]$p) {
+            $ep=(($p -split '/')|%{[uri]::EscapeDataString($_)}) -join '/'
+            $u="https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/$ep`?ref=master"
+            $o=Invoke-RestMethod -Uri $u -Headers $h
+            if(-not $o.content){throw "No content for $p"}
+            [Convert]::FromBase64String(($o.content -replace '\s',''))
+          }
+          $blob=$null;$wrapped=$null
+          for($i=0;$i -lt 180;$i++){
+            try{$blob=GetBin '.github/tmp-karate-fix6-v2/payload.enc';$wrapped=GetBin '.github/tmp-karate-fix6-v2/payload-key.enc';break}catch{Start-Sleep 2}
+          }
+          if($null -eq $blob -or $null -eq $wrapped){throw 'Payload timeout'}
+          $rsa=[System.Security.Cryptography.RSA]::Create();$n=0
+          $rsa.ImportPkcs8PrivateKey([IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'runner-private.der')),[ref]$n)
+          $k=$rsa.Decrypt($wrapped,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          [byte[]]$nonce=$blob[0..11];[byte[]]$tag=$blob[12..27];[byte[]]$cipher=$blob[28..($blob.Length-1)];[byte[]]$plain=New-Object byte[] $cipher.Length
+          $aes=[System.Security.Cryptography.AesGcm]::new($k,16);$aes.Decrypt($nonce,$cipher,$tag,$plain)
+          $zip=Join-Path $env:RUNNER_TEMP 'payload.zip';[IO.File]::WriteAllBytes($zip,$plain)
+          $work=Join-Path $env:RUNNER_TEMP 'work';Expand-Archive $zip $work -Force
+          "FIX6_WORK=$work"|Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host 'FIX6_PAYLOAD_DECRYPTED'
+
+      - name: Verify inputs and reproduce authoritative control
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          function H($f,$w){$g=(Get-FileHash (Join-Path $env:FIX6_WORK $f) -Algorithm SHA256).Hash.ToLowerInvariant();if($g-ne$w){throw "$f hash $g"}}
+          H 'Project_Nested.exe' '33a256a3a80b35ef41d1151b89e68b79ae7ed436762cf61b7f9a6c1c22204eb1'
+          H 'Project_Nested.smc' '58de4d61a524e4f718c660f7210668c3a83172e868ee966ae0f786870a448f5f'
+          H 'item8-source-fixed.nes' '532e7d2216061df9cc63f6e7bafa9059cd7469bbec6807934b7098f17a6bf3c2'
+          H 'item8-source-collision.nes' 'e3c62dd03ce325f25d3f1bf134603a812c5c4385047abcd3d68e5de7d62c985d'
+          H 'item8-call-seed.txt' '48a43c8a4c831f422307c6787af25077b882bd9a9d911bbcc551860d54bd76d3'
+          H 'item8-call-seed-collision.txt' '7470767ca2a78ce4ce61039de64f3202b926edc517c2b8aa796591cd1d345d4a'
+          Push-Location $env:FIX6_WORK
+          & .\Project_Nested.exe '.\item8-source-fixed.nes' '.\control.sfc' 'Karate Champ Rev A' 'Karate Champ MSU' 'twin' 'true' 'default' '.\item8-call-seed.txt' 2>&1|Tee-Object '.\control.log'
+          if($LASTEXITCODE-ne0){throw "control exit $LASTEXITCODE"}
+          $ch=(Get-FileHash '.\control.sfc' -Algorithm SHA256).Hash.ToLowerInvariant();Write-Host "FIX6_CONTROL_SHA256=$ch"
+          if($ch-ne'b6cc13859a769fb6d9d8e90977561d9760481d25a20ed7fe8f2260b81a7be917'){throw 'b6cc control reproduction failed'}
+          if((Get-Content '.\control.log' -Raw)-notmatch 'Known calls:\s*230'){throw 'known calls != 230'}
+          Write-Host 'FIX6_WINDOWS_CONTROL_REPRO_PASS'
+          Pop-Location
+
+      - name: Convert canonical collision source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop';Push-Location $env:FIX6_WORK
+          & .\Project_Nested.exe '.\item8-source-collision.nes' '.\collision.sfc' 'Karate Champ Rev A' 'Karate Champ MSU' 'twin' 'true' 'default' '.\item8-call-seed-collision.txt' 2>&1|Tee-Object '.\collision.log'
+          if($LASTEXITCODE-ne0){throw "collision exit $LASTEXITCODE"}
+          $h=(Get-FileHash '.\collision.sfc' -Algorithm SHA256).Hash.ToLowerInvariant();$s=(Get-Item '.\collision.sfc').Length
+          if($s-ne2097152){throw "bad collision size $s"};if($h-eq'b6cc13859a769fb6d9d8e90977561d9760481d25a20ed7fe8f2260b81a7be917'){throw 'unchanged output'}
+          Write-Host "FIX6_COLLISION_WINDOWS_SHA256=$h";Write-Host 'FIX6_COLLISION_WINDOWS_BUILD_PASS';Pop-Location
+
+      - name: Encrypt result for return
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop';$w=$env:FIX6_WORK;$d=Join-Path $env:RUNNER_TEMP 'result';New-Item -ItemType Directory -Force $d|Out-Null
+          Copy-Item (Join-Path $w 'collision.sfc') $d;Copy-Item (Join-Path $w 'control.log') $d;Copy-Item (Join-Path $w 'collision.log') $d
+          $c=(Get-FileHash (Join-Path $w 'control.sfc') -Algorithm SHA256).Hash.ToLowerInvariant();$h=(Get-FileHash (Join-Path $w 'collision.sfc') -Algorithm SHA256).Hash.ToLowerInvariant();@("control_sha256=$c","collision_sha256=$h")|Set-Content (Join-Path $d 'HASHES.txt') -Encoding ascii
+          $z=Join-Path $env:RUNNER_TEMP 'result.zip';Compress-Archive (Join-Path $d '*') $z -Force
+          $rsa=[System.Security.Cryptography.RSA]::Create();$n=0;$rsa.ImportSubjectPublicKeyInfo([IO.File]::ReadAllBytes((Join-Path $w 'return-public.der')),[ref]$n)
+          [byte[]]$k=[System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32);[byte[]]$nonce=[System.Security.Cryptography.RandomNumberGenerator]::GetBytes(12);[byte[]]$p=[IO.File]::ReadAllBytes($z);[byte[]]$ct=New-Object byte[] $p.Length;[byte[]]$tag=New-Object byte[] 16
+          $aes=[System.Security.Cryptography.AesGcm]::new($k,16);$aes.Encrypt($nonce,$p,$ct,$tag);[byte[]]$b=New-Object byte[] (28+$ct.Length);[Array]::Copy($nonce,0,$b,0,12);[Array]::Copy($tag,0,$b,12,16);[Array]::Copy($ct,0,$b,28,$ct.Length);[IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'result.enc'),$b)
+          [IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'result-key.enc'),$rsa.Encrypt($k,[System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256));Write-Host 'FIX6_RESULT_ENCRYPTED'
+
+      - name: Upload encrypted result only
+        uses: actions/upload-artifact@v4
+        with:
+          name: karate-fix6-encrypted-result-v2
+          path: |
+            ${{ runner.temp }}/result.enc
+            ${{ runner.temp }}/result-key.enc
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
